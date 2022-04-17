@@ -1,10 +1,5 @@
 package dev.jskw;
 
-import org.bouncycastle.operator.ContentSigner;
-import org.bouncycastle.operator.OperatorCreationException;
-import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
-import org.bouncycastle.util.encoders.Base64;
-
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.PasswordCallback;
 import java.io.File;
@@ -14,7 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.text.MessageFormat;
 import java.util.Arrays;
+import java.util.Base64;
 
+/**
+ * Sign using via a yubikey's pkcs11 interface without third party libraries.
+ */
 public class YSign {
     public static final char[] YUBIKEY_DEFAULT_PIN = new char[] {'1', '2', '3', '4', '5', '6'};
     public static final String SHA_256_WITH_ECDSA = "SHA256withECDSA";
@@ -38,7 +37,7 @@ public class YSign {
                 System.out.println("toBeSignedAscii = " + Arrays.toString(toBeSignedAscii));
                 signedData = signData(argsAsBinaryData);
             }
-            System.out.println("signedData = " + Base64.toBase64String(signedData));
+            System.out.println("signedData = " + Base64.getEncoder().encodeToString(signedData));
 
         } catch (Exception exception) {
             throw new RuntimeException(exception);
@@ -62,15 +61,15 @@ public class YSign {
      * @return signed data
      */
     private static byte[] signData(byte[]... tbsData) throws Exception {
-        ContentSigner contentSigner = getContentSigner();
+        var contentSigner = getContentSigner();
 
         // Write to be signed data to signer
         for (byte[] tbsDatum : tbsData) {
-            contentSigner.getOutputStream().write(tbsDatum);
+            contentSigner.update(tbsDatum);
         }
 
         // Generate & Return the signature
-        return contentSigner.getSignature();
+        return contentSigner.sign();
     }
 
 
@@ -81,23 +80,23 @@ public class YSign {
      * @return signed data
      */
     private static byte[] signData(File tbsData) throws Exception {
-        ContentSigner contentSigner = getContentSigner();
+        var contentSigner = getContentSigner();
 
         // Write to be signed data to signer
         try (FileInputStream fileInputStream = new FileInputStream(tbsData)) {
-            fileInputStream.transferTo(contentSigner.getOutputStream());
+            contentSigner.update(fileInputStream.readAllBytes());
         }
 
         // Generate & Return the signature
-        return contentSigner.getSignature();
+        return contentSigner.sign();
     }
 
     /**
-     * Provide a bouncy castle content signer.
+     * Provide a java sha256 signer.
      *
-     * @return a bouncy castle content signer.
+     * @return a java sha256 signer.
      */
-    private static ContentSigner getContentSigner() throws Exception {
+    private static Signature getContentSigner() throws Exception {
         // Get an auth provider that is powered by the Yubikey PKCS11 driver
         var provider = getProvider(getDriver());
         provider.login(null, getPasswordHandler(getYubikeyPin()));
@@ -109,11 +108,10 @@ public class YSign {
         // Get the key handle for our signing key
         PrivateKey privateKey = (PrivateKey) keyStore.getKey(DIGITAL_SIGNATURE_KEY_ALIAS, null);
 
-        // Get a bouncy castle content signer that supports PKCS11 keys. Most other
-        // signers will fail to sign with just a key handle.
-        JcaContentSignerBuilder contentSignerBuilder = new JcaContentSignerBuilder(SHA_256_WITH_ECDSA);
-        contentSignerBuilder.setProvider(provider);
-        return contentSignerBuilder.build(privateKey);
+        // Create a sha256 ECDSA signer
+        Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, provider);
+        shaSigner.initSign(privateKey);
+        return shaSigner;
     }
 
     /***
