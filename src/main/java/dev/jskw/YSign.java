@@ -62,7 +62,7 @@ public class YSign {
      * @return signed data
      */
     private static byte[] signData(byte[]... tbsData) throws Exception {
-        ContentSigner contentSigner = getContentSigner(getYubikeyPin());
+        ContentSigner contentSigner = getContentSigner();
 
         // Write to be signed data to signer
         for (byte[] tbsDatum : tbsData) {
@@ -81,7 +81,7 @@ public class YSign {
      * @return signed data
      */
     private static byte[] signData(File tbsData) throws Exception {
-        ContentSigner contentSigner = getContentSigner(getYubikeyPin());
+        ContentSigner contentSigner = getContentSigner();
 
         // Write to be signed data to signer
         try (FileInputStream fileInputStream = new FileInputStream(tbsData)) {
@@ -92,10 +92,15 @@ public class YSign {
         return contentSigner.getSignature();
     }
 
-    private static ContentSigner getContentSigner(char[] pin) throws Exception {
+    /**
+     * Provide a bouncy castle content signer.
+     *
+     * @return a bouncy castle content signer.
+     */
+    private static ContentSigner getContentSigner() throws Exception {
         // Get an auth provider that is powered by the Yubikey PKCS11 driver
         var provider = getProvider(getDriver());
-        provider.login(null, getPasswordHandler(pin));
+        provider.login(null, getPasswordHandler(getYubikeyPin()));
 
         // Get a keystore that uses our Yubikey Auth Provider
         var keyStore = KeyStore.getInstance("PKCS11", provider);
@@ -106,11 +111,6 @@ public class YSign {
 
         // Get a bouncy castle content signer that supports PKCS11 keys. Most other
         // signers will fail to sign with just a key handle.
-        ContentSigner contentSigner = getContentSigner(provider, privateKey);
-        return contentSigner;
-    }
-
-    private static ContentSigner getContentSigner(AuthProvider provider, PrivateKey privateKey) throws OperatorCreationException {
         JcaContentSignerBuilder contentSignerBuilder = new JcaContentSignerBuilder(SHA_256_WITH_ECDSA);
         contentSignerBuilder.setProvider(provider);
         return contentSignerBuilder.build(privateKey);
@@ -179,8 +179,10 @@ public class YSign {
      *         with the given password.
      */
     public static CallbackHandler getPasswordHandler(char[] password) {
-        return (callbacks) -> Arrays.stream(callbacks)
-                .filter(callback -> callback instanceof PasswordCallback)
-                .forEach(callback -> ((PasswordCallback) callback).setPassword(password));
+        return (callbacks) -> Arrays.stream(callbacks).forEach(callback -> {
+            if (callback instanceof PasswordCallback) {
+                ((PasswordCallback) callback).setPassword(password);
+            }
+        });
     }
 }
