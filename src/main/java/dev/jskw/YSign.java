@@ -2,6 +2,7 @@ package dev.jskw;
 
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.PasswordCallback;
+import javax.security.auth.login.LoginException;
 import java.io.File;
 import java.io.FileInputStream;
 import java.lang.reflect.Method;
@@ -18,6 +19,13 @@ public class YSign {
     public static final char[] YUBIKEY_DEFAULT_PIN = new char[] {'1', '2', '3', '4', '5', '6'};
     public static final String SHA_256_WITH_ECDSA = "SHA256withECDSA";
     public static final String DIGITAL_SIGNATURE_KEY_ALIAS = "X.509 Certificate for Digital Signature";
+    private static final ThreadLocal<AuthProvider> AUTH_PROVIDER = ThreadLocal.withInitial(() -> {
+        try {
+            return getProvider(getDriver());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    });
 
     public static void main(String[] toBeSignedAscii) {
         byte[][] argsAsBinaryData = Arrays.stream(toBeSignedAscii)
@@ -29,18 +37,36 @@ public class YSign {
                 toBeSignedFile = new File(toBeSignedAscii[0]);
             }
 
-            final byte[] signedData;
-            if (toBeSignedFile != null && toBeSignedFile.exists()) {
-                System.out.println("toBeSignedFile = " + toBeSignedFile);
-                signedData = signData(toBeSignedFile);
-            } else {
-                System.out.println("toBeSignedAscii = " + Arrays.toString(toBeSignedAscii));
-                signedData = signData(argsAsBinaryData);
+            String message = null;
+            // Run multiple times with java -DNUMBER_OF_SIGNATURES=1000
+            // 2:05 to do 1000 signatures or ~125ms per signature
+            for (int i = 0; i < Integer.getInteger("NUMBER_OF_SIGNATURES", 1); i++) {
+                YSign.AUTH_PROVIDER.get().logout();
+                final byte[] signedData;
+                if (toBeSignedFile != null && toBeSignedFile.exists()) {
+                    message = "toBeSignedFile = " + toBeSignedFile;
+                    signedData = signData(toBeSignedFile);
+                } else {
+                    message = "toBeSignedAscii = " + Arrays.toString(toBeSignedAscii);
+                    signedData = signData(argsAsBinaryData);
+                }
+                System.out.println("signedData = " + Base64.getEncoder().encodeToString(signedData));
             }
-            System.out.println("signedData = " + Base64.getEncoder().encodeToString(signedData));
-
+            System.out.println(message);
         } catch (Exception exception) {
             throw new RuntimeException(exception);
+        } finally {
+            try {
+                synchronized (AUTH_PROVIDER) {
+                    AuthProvider authProvider = YSign.AUTH_PROVIDER.get();
+                    if (authProvider != null) {
+                        authProvider.logout();
+                        System.out.println("authProvider = " + authProvider);
+                    }
+                }
+            } catch (LoginException exception) {
+                exception.printStackTrace();
+            }
         }
     }
 
@@ -98,18 +124,19 @@ public class YSign {
      */
     private static Signature getContentSigner() throws Exception {
         // Get an auth provider that is powered by the Yubikey PKCS11 driver
-        var provider = getProvider(getDriver());
-        provider.login(null, getPasswordHandler(getYubikeyPin()));
+        var authProvider = AUTH_PROVIDER.get();
 
         // Get a keystore that uses our Yubikey Auth Provider
-        var keyStore = KeyStore.getInstance("PKCS11", provider);
+        var callback = new KeyStore.CallbackHandlerProtection(getPasswordHandler(getYubikeyPin()));
+        var keyStoreBuilder = KeyStore.Builder.newInstance("PKCS11", authProvider, callback);
+        var keyStore = keyStoreBuilder.getKeyStore();
         keyStore.load(null, null);
 
         // Get the key handle for our signing key
         PrivateKey privateKey = (PrivateKey) keyStore.getKey(DIGITAL_SIGNATURE_KEY_ALIAS, null);
 
         // Create a sha256 ECDSA signer
-        Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, provider);
+        Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, authProvider);
         shaSigner.initSign(privateKey);
         return shaSigner;
     }
@@ -133,6 +160,7 @@ public class YSign {
      * @return the pkcs11 driver.
      */
     public static File getDriver() throws Exception {
+        @SuppressWarnings("SpellCheckingInspection") // don't spellcheck driver filenames
         var paths = new String[] {
                 // Linux 32bit
                 "/usr/lib/libykcs11.so",
