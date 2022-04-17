@@ -16,16 +16,40 @@ import java.util.Base64;
  * Sign using via a yubikey's pkcs11 interface without third party libraries.
  */
 public class YSign {
-    public static final char[] YUBIKEY_DEFAULT_PIN = new char[] {'1', '2', '3', '4', '5', '6'};
+    private static final String CONFIG_PKCS_11_LIB = "PKCS11_LIB";
+    private static final String CONFIG_NUMBER_OF_SIGNATURES = "NUMBER_OF_SIGNATURES";
+    private static final String CONFIG_YUBIKEY_PIN = "YUBIKEY_PIN";
+    protected static final char[] YUBIKEY_DEFAULT_PIN = new char[] {'1', '2', '3', '4', '5', '6'};
     public static final String SHA_256_WITH_ECDSA = "SHA256withECDSA";
     public static final String DIGITAL_SIGNATURE_KEY_ALIAS = "X.509 Certificate for Digital Signature";
-    private static final ThreadLocal<AuthProvider> AUTH_PROVIDER = ThreadLocal.withInitial(() -> {
-        try {
-            return getProvider(getDriver());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    });
+    private static final AuthProvider AUTH_PROVIDER = getProvider();
+
+    @SuppressWarnings("SpellCheckingInspection") // don't spellcheck driver filenames
+    private static final String[] DEFAULT_PKCS_11_LIB_PATHS = new String[] {
+            // Linux 32bit
+            "/usr/lib/libykcs11.so",
+            "/usr/lib/libykcs11.so.1",
+            "/usr/lib/i386-linux-gnu/libykcs11.so",
+            "/usr/lib/arm-linux-gnueabi/libykcs11.so",
+            "/usr/lib/arm-linux-gnueabihf/libykcs11.so",
+
+            // Linux 64bit
+            "/usr/lib64/libykcs11.so",
+            "/usr/lib64/libykcs11.so.1",
+            "/usr/lib/x86_64-linux-gnu/libykcs11.so",
+            "/usr/lib/aarch64-linux-gnu/libykcs11.so",
+            "/usr/lib/mips64el-linux-gnuabi64/libykcs11.so",
+            "/usr/lib/riscv64-linux-gnu/libykcs11.so",
+
+            // Windows 32bit
+            System.getenv("ProgramFiles(x86)") + "/Yubico/Yubico PIV Tool/bin/libykcs11.dll",
+
+            // Windows 64bit
+            System.getenv("ProgramFiles") + "/Yubico/Yubico PIV Tool/bin/libykcs11.dll",
+
+            // OSX
+            "/usr/local/lib/libykcs11.dylib",
+    };
 
     public static void main(String[] toBeSignedAscii) {
         byte[][] argsAsBinaryData = Arrays.stream(toBeSignedAscii)
@@ -40,8 +64,8 @@ public class YSign {
             String message = null;
             // Run multiple times with java -DNUMBER_OF_SIGNATURES=1000
             // 2:05 to do 1000 signatures or ~125ms per signature
-            for (int i = 0; i < Integer.getInteger("NUMBER_OF_SIGNATURES", 1); i++) {
-                YSign.AUTH_PROVIDER.get().logout();
+            for (int i = 0; i < getIntConfigOrDefault(CONFIG_NUMBER_OF_SIGNATURES, 1); i++) {
+                AUTH_PROVIDER.logout();
                 final byte[] signedData;
                 if (toBeSignedFile != null && toBeSignedFile.exists()) {
                     message = "toBeSignedFile = " + toBeSignedFile;
@@ -58,10 +82,9 @@ public class YSign {
         } finally {
             try {
                 synchronized (AUTH_PROVIDER) {
-                    AuthProvider authProvider = YSign.AUTH_PROVIDER.get();
-                    if (authProvider != null) {
-                        authProvider.logout();
-                        System.out.println("authProvider = " + authProvider);
+                    if (AUTH_PROVIDER != null) {
+                        AUTH_PROVIDER.logout();
+                        System.out.println("authProvider = " + AUTH_PROVIDER);
                     }
                 }
             } catch (LoginException exception) {
@@ -72,8 +95,8 @@ public class YSign {
 
     private static char[] getYubikeyPin() {
         final char[] pin;
-        if (System.getenv().containsKey("YUBIKEY_PIN")) {
-            pin = System.getenv("YUBIKEY_PIN").toCharArray();
+        if (System.getenv().containsKey(CONFIG_YUBIKEY_PIN)) {
+            pin = System.getenv(CONFIG_YUBIKEY_PIN).toCharArray();
         } else {
             pin = YUBIKEY_DEFAULT_PIN;
         }
@@ -123,12 +146,9 @@ public class YSign {
      * @return a java sha256 signer.
      */
     private static Signature getContentSigner() throws Exception {
-        // Get an auth provider that is powered by the Yubikey PKCS11 driver
-        var authProvider = AUTH_PROVIDER.get();
-
         // Get a keystore that uses our Yubikey Auth Provider
         var callback = new KeyStore.CallbackHandlerProtection(getPasswordHandler(getYubikeyPin()));
-        var keyStoreBuilder = KeyStore.Builder.newInstance("PKCS11", authProvider, callback);
+        var keyStoreBuilder = KeyStore.Builder.newInstance("PKCS11", AUTH_PROVIDER, callback);
         var keyStore = keyStoreBuilder.getKeyStore();
         keyStore.load(null, null);
 
@@ -136,7 +156,7 @@ public class YSign {
         PrivateKey privateKey = (PrivateKey) keyStore.getKey(DIGITAL_SIGNATURE_KEY_ALIAS, null);
 
         // Create a sha256 ECDSA signer
-        Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, authProvider);
+        Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, AUTH_PROVIDER);
         shaSigner.initSign(privateKey);
         return shaSigner;
     }
@@ -144,14 +164,18 @@ public class YSign {
     /***
      * Get an auth provider that wraps the PKCS11 interface suitable for signatures.
      *
-     * @param driver the PKCS11 driver used to communicate with the Yubikey.
      * @return An auth provider that wraps the PKCS11 interface.
      */
-    public static AuthProvider getProvider(File driver) throws Exception {
-        String config = MessageFormat.format("--name=yubikey\nlibrary = {0}", driver.getAbsolutePath());
-        Method providerConfigureMethod = Provider.class.getMethod("configure", String.class);
-        Provider provider = Security.getProvider("SunPKCS11");
-        return (AuthProvider) providerConfigureMethod.invoke(provider, config);
+    public static AuthProvider getProvider() {
+        try {
+            File driver = getDriver();
+            String config = MessageFormat.format("--name=yubikey\nlibrary = {0}", driver.getAbsolutePath());
+            Method providerConfigureMethod = Provider.class.getMethod("configure", String.class);
+            Provider provider = Security.getProvider("SunPKCS11");
+            return (AuthProvider) providerConfigureMethod.invoke(provider, config);
+        } catch (Exception exception) {
+            throw new RuntimeException(exception);
+        }
     }
 
     /***
@@ -160,32 +184,12 @@ public class YSign {
      * @return the pkcs11 driver.
      */
     public static File getDriver() throws Exception {
-        @SuppressWarnings("SpellCheckingInspection") // don't spellcheck driver filenames
-        var paths = new String[] {
-                // Linux 32bit
-                "/usr/lib/libykcs11.so",
-                "/usr/lib/libykcs11.so.1",
-                "/usr/lib/i386-linux-gnu/libykcs11.so",
-                "/usr/lib/arm-linux-gnueabi/libykcs11.so",
-                "/usr/lib/arm-linux-gnueabihf/libykcs11.so",
+        var paths = getStringConfigOrDefault(CONFIG_PKCS_11_LIB, "").split(":");
 
-                // Linux 64bit
-                "/usr/lib64/libykcs11.so",
-                "/usr/lib64/libykcs11.so.1",
-                "/usr/lib/x86_64-linux-gnu/libykcs11.so",
-                "/usr/lib/aarch64-linux-gnu/libykcs11.so",
-                "/usr/lib/mips64el-linux-gnuabi64/libykcs11.so",
-                "/usr/lib/riscv64-linux-gnu/libykcs11.so",
-
-                // Windows 32bit
-                System.getenv("ProgramFiles(x86)") + "/Yubico/Yubico PIV Tool/bin/libykcs11.dll",
-
-                // Windows 64bit
-                System.getenv("ProgramFiles") + "/Yubico/Yubico PIV Tool/bin/libykcs11.dll",
-
-                // OSX
-                "/usr/local/lib/libykcs11.dylib",
-        };
+        if (paths.length == 0 || paths[0].equals("")) {
+            // Use default paths if no configured paths set
+            paths = DEFAULT_PKCS_11_LIB_PATHS;
+        }
 
         for (String path : paths) {
             File pkcs11Path = new File(path);
@@ -205,10 +209,28 @@ public class YSign {
      *         with the given password.
      */
     public static CallbackHandler getPasswordHandler(char[] password) {
-        return (callbacks) -> Arrays.stream(callbacks).forEach(callback -> {
-            if (callback instanceof PasswordCallback) {
-                ((PasswordCallback) callback).setPassword(password);
+        return callbacks -> Arrays.stream(callbacks).forEach(callback -> {
+            if (callback instanceof PasswordCallback passwordCallback) {
+                passwordCallback.setPassword(password);
             }
         });
+    }
+
+    public static String getStringConfigOrDefault(String key, String defaultValue) {
+        if (System.getenv().containsKey(key)) {
+            return System.getenv(key);
+        } else if (System.getProperties().containsKey(key)) {
+            return System.getProperty(key);
+        }
+
+        return defaultValue;
+    }
+
+    public static int getIntConfigOrDefault(String key, int defaultValue) {
+        if (System.getenv().containsKey(key)) {
+            return Integer.parseInt(System.getenv(key));
+        }
+
+        return Integer.getInteger(key, defaultValue);
     }
 }
