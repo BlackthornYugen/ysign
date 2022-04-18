@@ -5,9 +5,11 @@ import javax.security.auth.callback.PasswordCallback;
 import javax.security.auth.login.LoginException;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
+import java.security.cert.CertificateException;
 import java.text.MessageFormat;
 import java.util.Arrays;
 import java.util.Base64;
@@ -55,8 +57,10 @@ public class YSign {
         byte[][] argsAsBinaryData = Arrays.stream(toBeSignedAscii)
                 .map(arg -> arg.getBytes(StandardCharsets.UTF_8))
                 .toArray(byte[][]::new);
+        byte[] signedData = new byte[0];
+        File toBeSignedFile;
         try {
-            File toBeSignedFile = null;
+            toBeSignedFile = null;
             if (toBeSignedAscii.length == 1) {
                 toBeSignedFile = new File(toBeSignedAscii[0]);
             }
@@ -66,7 +70,6 @@ public class YSign {
             // 2:05 to do 1000 signatures or ~125ms per signature
             for (int i = 0; i < getIntConfigOrDefault(CONFIG_NUMBER_OF_SIGNATURES, 1); i++) {
                 AUTH_PROVIDER.logout();
-                final byte[] signedData;
                 if (toBeSignedFile != null && toBeSignedFile.exists()) {
                     message = "toBeSignedFile = " + toBeSignedFile;
                     signedData = signData(toBeSignedFile);
@@ -81,16 +84,24 @@ public class YSign {
             throw new RuntimeException(exception);
         } finally {
             try {
-                synchronized (AUTH_PROVIDER) {
-                    if (AUTH_PROVIDER != null) {
+                if (AUTH_PROVIDER != null) {
+                    System.out.println("authProvider = " + AUTH_PROVIDER);
+                    synchronized (AUTH_PROVIDER) {
                         AUTH_PROVIDER.logout();
-                        System.out.println("authProvider = " + AUTH_PROVIDER);
                     }
                 }
             } catch (LoginException exception) {
                 exception.printStackTrace();
             }
         }
+
+        final boolean validSignature;
+        if (toBeSignedFile != null && toBeSignedFile.exists()) {
+            validSignature = verifyData(signedData, toBeSignedFile);
+        } else {
+            validSignature = verifyData(signedData, argsAsBinaryData);
+        }
+        System.out.println("validSignature = " + validSignature);
     }
 
     private static char[] getYubikeyPin() {
@@ -129,15 +140,50 @@ public class YSign {
      * @return signed data
      */
     private static byte[] signData(File tbsData) throws Exception {
-        var contentSigner = getContentSigner();
-
-        // Write to be signed data to signer
         try (FileInputStream fileInputStream = new FileInputStream(tbsData)) {
-            contentSigner.update(fileInputStream.readAllBytes());
+            return signData(fileInputStream.readAllBytes());
         }
+    }
 
-        // Generate & Return the signature
-        return contentSigner.sign();
+    /***
+     * Verify a signature using the public key from the yubikey.
+     *
+     * @param signature signature bytes
+     * @param signedFile file that was signed
+     * @return true if signature is valid
+     */
+    private static boolean verifyData(byte[] signature, File signedFile) {
+        try (FileInputStream fileInputStream = new FileInputStream(signedFile)) {
+            return verifyData(signature, fileInputStream.readAllBytes());
+        } catch (IOException exception) {
+            System.err.println("Failed to read file: " + exception.getMessage());
+            return false;
+        }
+    }
+
+    /***
+     * Verify a signature using the public key from the yubikey.
+     *
+     * @param signature signature bytes
+     * @param data data that was signed
+     * @return true if signature is valid
+     */
+    private static boolean verifyData(byte[] signature, byte[]... data) {
+        try {
+            PublicKey publicKey = getKeyStore().getCertificate(DIGITAL_SIGNATURE_KEY_ALIAS).getPublicKey();
+            System.out.println("publicKey = " + publicKey);
+
+            // Verification done outside yubikey, do not use AUTH_PROVIDER
+            Signature shaVerifier = Signature.getInstance(SHA_256_WITH_ECDSA);
+            shaVerifier.initVerify(publicKey);
+            for (byte[] datum : data) {
+                shaVerifier.update(datum);
+            }
+            return shaVerifier.verify(signature);
+        } catch (KeyStoreException | NoSuchAlgorithmException | InvalidKeyException | SignatureException exception) {
+            System.err.println(exception.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -146,19 +192,29 @@ public class YSign {
      * @return a java sha256 signer.
      */
     private static Signature getContentSigner() throws Exception {
-        // Get a keystore that uses our Yubikey Auth Provider
-        var callback = new KeyStore.CallbackHandlerProtection(getPasswordHandler(getYubikeyPin()));
-        var keyStoreBuilder = KeyStore.Builder.newInstance("PKCS11", AUTH_PROVIDER, callback);
-        var keyStore = keyStoreBuilder.getKeyStore();
-        keyStore.load(null, null);
-
         // Get the key handle for our signing key
-        PrivateKey privateKey = (PrivateKey) keyStore.getKey(DIGITAL_SIGNATURE_KEY_ALIAS, null);
+        PrivateKey privateKey = (PrivateKey) getKeyStore().getKey(DIGITAL_SIGNATURE_KEY_ALIAS, null);
 
         // Create a sha256 ECDSA signer
         Signature shaSigner = Signature.getInstance(SHA_256_WITH_ECDSA, AUTH_PROVIDER);
         shaSigner.initSign(privateKey);
         return shaSigner;
+    }
+
+    /**
+     * Get a keystore that uses our Yubikey Auth Provider
+     * @return a keystore that uses our Yubikey Auth Provider
+     */
+    private static KeyStore getKeyStore() throws KeyStoreException {
+        var callback = new KeyStore.CallbackHandlerProtection(getPasswordHandler(getYubikeyPin()));
+        var keyStoreBuilder = KeyStore.Builder.newInstance("PKCS11", AUTH_PROVIDER, callback);
+        var keyStore = keyStoreBuilder.getKeyStore();
+        try {
+            keyStore.load(null, null);
+        } catch (IOException | NoSuchAlgorithmException | CertificateException keyStoreException) {
+            throw new KeyStoreException(keyStoreException.getMessage(), keyStoreException);
+        }
+        return keyStore;
     }
 
     /***
